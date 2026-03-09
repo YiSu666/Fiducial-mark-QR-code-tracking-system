@@ -1,0 +1,360 @@
+#include <iostream>
+#include <opencv2/opencv.hpp>
+#include <opencv2/highgui/highgui.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/objdetect/objdetect.hpp>
+#include <opencv2/core/core.hpp>
+#include <opencv2/features2d/features2d.hpp>
+#include <zbar.h>
+#include <zmq.hpp>
+#include <string>
+#include <cmath>
+#include <iomanip>
+
+using namespace std;
+using namespace zbar;
+using namespace cv;
+
+double qrCodeSize = 4.8;
+int qrCodeSize_cal = 48;
+double erosion_size = 0.1;
+int erosion = 1;
+
+void on_trackbar_erosionSize(int value, void*) {
+    erosion_size = value / 10.0;
+}
+
+void on_trackbar_calibration(int value1, void*) {
+    qrCodeSize = value1 / 10.0;
+}
+
+void drawPolygon(Mat& frame, const vector<Point2f>& pts, Scalar color) {
+    vector<Point> intPoints;
+    for (const auto& pt : pts) {
+        intPoints.push_back(Point(static_cast<int>(pt.x), static_cast<int>(pt.y)));
+    }
+
+    const Point* ppt[1] = { intPoints.data() };
+    int npts[] = { static_cast<int>(intPoints.size()) };
+
+    fillPoly(frame, ppt, npts, 1, color, LINE_AA);
+}
+
+string round2d(double value) {
+    stringstream stream;
+    stream << fixed << setprecision(2) << value;
+    return stream.str();
+}
+
+double rad2Deg(double radians) {
+    return radians * (180.0 / 3.141593);
+}
+
+Vec3d rotationVectorToEulerAngles(const Mat& rVec) {
+    Mat rotationMatrix;
+    Rodrigues(rVec, rotationMatrix);
+
+    double sy = sqrt(rotationMatrix.at<double>(0, 0) * rotationMatrix.at<double>(0, 0) +
+        rotationMatrix.at<double>(1, 0) * rotationMatrix.at<double>(1, 0));
+
+    bool singular = sy < 1e-6;
+
+    double x, y, z;
+    if (!singular) {
+        x = atan2(rotationMatrix.at<double>(2, 1), rotationMatrix.at<double>(2, 2));
+        y = atan2(-rotationMatrix.at<double>(2, 0), sy);
+        z = atan2(rotationMatrix.at<double>(1, 0), rotationMatrix.at<double>(0, 0));
+    } else {
+        x = atan2(-rotationMatrix.at<double>(1, 2), rotationMatrix.at<double>(1, 1));
+        y = atan2(-rotationMatrix.at<double>(2, 0), sy);
+        z = 0;
+    }
+
+    return Vec3d(x, y, z);
+}
+
+int main() {
+    // ZeroMQ context and subscriber socket setup
+    zmq::context_t context(1);
+    zmq::socket_t socket(context, ZMQ_SUB);
+    socket.connect("tcp://localhost:5555");
+    socket.setsockopt(ZMQ_SUBSCRIBE, "", 0);
+
+    namedWindow("Control panel");
+    createTrackbar("Erosion", "Control panel", &erosion, 10, on_trackbar_erosionSize);
+    createTrackbar("Calibration", "Control panel", &qrCodeSize_cal, 50, on_trackbar_calibration);
+
+    double fx = 1251.855, fy = 1253.9, cx = 664.3744, cy = 360.8577;
+    double k1 = -0.3467, k2 = 0.0737, p1 = 0, p2 = 0, k3 = 0;
+
+    Mat cameraMatrix = (Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
+    Mat distortionCoeffs = (Mat_<double>(1, 5) << k1, k2, p1, p2, k3);
+
+    double eyeOffset = 0.03; // Reduce the IPD to make cubes closer
+    double eyeOffsetPixels = eyeOffset * fx; // Convert eye separation to pixels using focal length
+
+    Mat cameraMatrixLeft = cameraMatrix.clone();
+    cameraMatrixLeft.at<double>(0, 2) -= eyeOffsetPixels / 2;
+
+    Mat cameraMatrixRight = cameraMatrix.clone();
+    cameraMatrixRight.at<double>(0, 2) += eyeOffsetPixels / 2;
+
+    vector<Point3f> objectPoints = {
+        Point3f(-qrCodeSize / 2, qrCodeSize / 2, 0),
+        Point3f(qrCodeSize / 2, qrCodeSize / 2, 0),
+        Point3f(qrCodeSize / 2, -qrCodeSize / 2, 0),
+        Point3f(-qrCodeSize / 2, -qrCodeSize / 2, 0)
+    };
+
+    vector<Point3f> cubePoints = {
+        {static_cast<float>(qrCodeSize / 2), static_cast<float>(qrCodeSize / 2), 0.0f},
+        {static_cast<float>(-qrCodeSize / 2), static_cast<float>(qrCodeSize / 2), 0.0f},
+        {static_cast<float>(-qrCodeSize / 2), static_cast<float>(-qrCodeSize / 2), 0.0f},
+        {static_cast<float>(qrCodeSize / 2), static_cast<float>(-qrCodeSize / 2), 0.0f},
+        {static_cast<float>(qrCodeSize / 2), static_cast<float>(qrCodeSize / 2), -static_cast<float>(qrCodeSize)},
+        {static_cast<float>(-qrCodeSize / 2), static_cast<float>(qrCodeSize / 2), -static_cast<float>(qrCodeSize)},
+        {static_cast<float>(-qrCodeSize / 2), static_cast<float>(-qrCodeSize / 2), -static_cast<float>(qrCodeSize)},
+        {static_cast<float>(qrCodeSize / 2), static_cast<float>(-qrCodeSize / 2), -static_cast<float>(qrCodeSize)}
+    };
+
+    Mat gray_prev;
+    vector<Point2f> prev_points;
+    bool qrDetected = false;
+
+    while (true) {
+        zmq::message_t message;
+        socket.recv(&message);
+
+        vector<uchar> data(message.size());
+        memcpy(data.data(), message.data(), message.size());
+
+        Mat frame = imdecode(data, IMREAD_COLOR);
+        if (frame.empty()) {
+            cerr << "Received an empty frame, exiting..." << endl;
+            break;
+        }
+
+        Mat grayFrame;
+        cvtColor(frame, grayFrame, COLOR_BGR2GRAY);
+        GaussianBlur(grayFrame, grayFrame, Size(3, 3), 1);
+
+        Mat dst;
+        double thresh = 0;
+        double maxValue = 255;
+        double thres = threshold(grayFrame, dst, thresh, maxValue, THRESH_OTSU);
+
+        Mat erodedFrame;
+        Mat element = getStructuringElement(MORPH_RECT,
+            Size(2 * erosion_size + 1, 2 * erosion_size + 1),
+            Point(erosion_size, erosion_size));
+        erode(dst, erodedFrame, element);
+
+        ImageScanner scanner;
+        scanner.set_config(ZBAR_NONE, ZBAR_CFG_ENABLE, 1);
+        int width = erodedFrame.cols;
+        int height = erodedFrame.rows;
+        uchar* raw = (uchar*)(erodedFrame.data);
+        Image image(width, height, "Y800", raw, width * height);
+
+        scanner.scan(image);
+
+        string qrData;
+        vector<Point> points;
+
+        for (Image::SymbolIterator symbol = image.symbol_begin(); symbol != image.symbol_end(); ++symbol) {
+            qrData = symbol->get_data();
+            for (int i = 0; i < symbol->get_location_size(); i++) {
+                points.push_back(Point(symbol->get_location_x(i), symbol->get_location_y(i)));
+            }
+        }
+
+        if (!qrData.empty() && points.size() == 4) {
+            qrDetected = true;
+
+            vector<Point2f> imagePoints;
+            for (const auto& point : points)
+                imagePoints.push_back(Point2f(point.x, point.y));
+
+            Mat rVec, tVec;
+            solvePnP(objectPoints, imagePoints, cameraMatrix, distortionCoeffs, rVec, tVec);
+            Vec3d eulerVec = rotationVectorToEulerAngles(rVec);
+            vector<Point2f> projectedPointsLeft, projectedPointsRight;
+
+            projectPoints(cubePoints, rVec, tVec, cameraMatrixLeft, distortionCoeffs, projectedPointsLeft);
+            projectPoints(cubePoints, rVec, tVec, cameraMatrixRight, distortionCoeffs, projectedPointsRight);
+
+            Mat cubeFrameLeft = Mat::zeros(frame.size(), frame.type());
+            Mat cubeFrameRight = Mat::zeros(frame.size(), frame.type());
+
+            for (int i = 0; i < 4; i++) {
+                line(cubeFrameLeft, projectedPointsLeft[i], projectedPointsLeft[(i + 1) % 4], Scalar(255, 0, 0), 2);  // Bottom square
+                line(cubeFrameLeft, projectedPointsLeft[i + 4], projectedPointsLeft[(i + 1) % 4 + 4], Scalar(255, 0, 0), 2);  // Top square
+                line(cubeFrameLeft, projectedPointsLeft[i], projectedPointsLeft[i + 4], Scalar(255, 0, 0), 2);  // Vertical lines
+
+                line(cubeFrameRight, projectedPointsRight[i], projectedPointsRight[(i + 1) % 4], Scalar(255, 0, 0), 2);  // Bottom square
+                line(cubeFrameRight, projectedPointsRight[i + 4], projectedPointsRight[(i + 1) % 4 + 4], Scalar(255, 0, 0), 2);  // Top square
+                line(cubeFrameRight, projectedPointsRight[i], projectedPointsRight[i + 4], Scalar(255, 0, 0), 2);  // Vertical lines
+            }
+
+            drawPolygon(cubeFrameLeft, vector<Point2f> {projectedPointsLeft[0], projectedPointsLeft[1], projectedPointsLeft[2], projectedPointsLeft[3]}, Scalar(100, 100, 255)); // Front face
+            drawPolygon(cubeFrameLeft, vector<Point2f> {projectedPointsLeft[4], projectedPointsLeft[5], projectedPointsLeft[6], projectedPointsLeft[7]}, Scalar(100, 255, 100)); // Back face
+            drawPolygon(cubeFrameLeft, vector<Point2f> {projectedPointsLeft[0], projectedPointsLeft[3], projectedPointsLeft[7], projectedPointsLeft[4]}, Scalar(255, 100, 100)); // Left face
+            drawPolygon(cubeFrameLeft, vector<Point2f> {projectedPointsLeft[1], projectedPointsLeft[2], projectedPointsLeft[6], projectedPointsLeft[5]}, Scalar(100, 255, 255)); // Right face
+            drawPolygon(cubeFrameLeft, vector<Point2f> {projectedPointsLeft[0], projectedPointsLeft[1], projectedPointsLeft[5], projectedPointsLeft[4]}, Scalar(255, 255, 100)); // Top face
+            drawPolygon(cubeFrameLeft, vector<Point2f> {projectedPointsLeft[2], projectedPointsLeft[3], projectedPointsLeft[7], projectedPointsLeft[6]}, Scalar(255, 100, 255)); // Bottom face
+
+            drawPolygon(cubeFrameRight, vector<Point2f> {projectedPointsRight[0], projectedPointsRight[1], projectedPointsRight[2], projectedPointsRight[3]}, Scalar(100, 100, 255)); // Front face
+            drawPolygon(cubeFrameRight, vector<Point2f> {projectedPointsRight[4], projectedPointsRight[5], projectedPointsRight[6], projectedPointsRight[7]}, Scalar(100, 255, 100)); // Back face
+            drawPolygon(cubeFrameRight, vector<Point2f> {projectedPointsRight[0], projectedPointsRight[3], projectedPointsRight[7], projectedPointsRight[4]}, Scalar(255, 100, 100)); // Left face
+            drawPolygon(cubeFrameRight, vector<Point2f> {projectedPointsRight[1], projectedPointsRight[2], projectedPointsRight[6], projectedPointsRight[5]}, Scalar(100, 255, 255)); // Right face
+            drawPolygon(cubeFrameRight, vector<Point2f> {projectedPointsRight[0], projectedPointsRight[1], projectedPointsRight[5], projectedPointsRight[4]}, Scalar(255, 255, 100)); // Top face
+            drawPolygon(cubeFrameRight, vector<Point2f> {projectedPointsRight[2], projectedPointsRight[3], projectedPointsRight[7], projectedPointsRight[6]}, Scalar(255, 100, 255)); // Bottom face
+
+            string angle_str = "Angle: X: " + round2d(rad2Deg(eulerVec[0])) +
+                " Y: " + round2d(rad2Deg(eulerVec[1])) +
+                " Z: " + round2d(rad2Deg(eulerVec[2]));
+
+            string locat_str = "Distance: " + round2d(tVec.at<double>(2, 0)) + " CM";
+            putText(cubeFrameLeft, angle_str, Point(10, 30), FONT_HERSHEY_SIMPLEX, 1.0, Scalar(0, 0, 255), 2);
+            putText(cubeFrameLeft, locat_str, Point(10, 60), FONT_HERSHEY_SIMPLEX, 1.0, Scalar(255, 0, 255), 2);
+
+            putText(cubeFrameRight, angle_str, Point(10, 30), FONT_HERSHEY_SIMPLEX, 1.0, Scalar(0, 0, 255), 2);
+            putText(cubeFrameRight, locat_str, Point(10, 60), FONT_HERSHEY_SIMPLEX, 1.0, Scalar(255, 0, 255), 2);
+
+            Mat combinedFrame(Size(800, 480), frame.type());
+            Mat left(combinedFrame, Rect(0, 0, 400, 480));
+            Mat right(combinedFrame, Rect(400, 0, 400, 480));
+
+            resize(cubeFrameLeft, left, Size(400, 480));
+            resize(cubeFrameRight, right, Size(400, 480));
+
+            imshow("Side-by-Side Cube", combinedFrame);
+
+            resizeWindow("Side-by-Side Cube", 800, 480); // Adjust window size
+
+            // Store points for optical flow
+            prev_points.clear();
+            for (const auto& point : points) {
+                prev_points.push_back(Point2f(point.x, point.y));
+            }
+            grayFrame.copyTo(gray_prev);
+        } else if (qrDetected) {
+            vector<Point2f> next_points;
+            vector<uchar> status;
+            vector<float> err;
+
+            if (!gray_prev.empty() && !prev_points.empty()) {
+                calcOpticalFlowPyrLK(gray_prev, grayFrame, prev_points, next_points, status, err, Size(21, 21), 2);
+
+                int k = 0;
+                vector<Point> new_points(4);
+                for (size_t i = 0; i < next_points.size(); i++) {
+                    if (status[i] && ((abs(prev_points[i].x - next_points[i].x) + abs(prev_points[i].y - next_points[i].y)) > 2)) {
+                        if (k < new_points.size()) {
+                            prev_points[k] = next_points[i];
+                            new_points[k] = Point(next_points[i].x, next_points[i].y);
+                            k++;
+                            string flow = " Optical Flow Activated! ";
+                            putText(frame, flow, Point(10, 85), FONT_HERSHEY_SIMPLEX, 1.0, Scalar(0, 128, 255), 2);
+                        }
+                    }
+                }
+                prev_points.resize(k);
+                new_points.resize(k);
+
+                if (new_points.size() == 4) {
+                    for (int i = 0; i < 4; i++)
+                        line(frame, new_points[i], new_points[(i + 1) % 4], Scalar(0, 255, 0), 2);
+
+                    Point2f qrCenter(0, 0);
+                    for (const auto& point : new_points) {
+                        qrCenter.x += point.x;
+                        qrCenter.y += point.y;
+                    }
+                    qrCenter.x /= 4;
+                    qrCenter.y /= 4;
+
+                    vector<Point2f> imagePoints;
+                    for (const auto& point : new_points)
+                        imagePoints.push_back(Point2f(point.x, point.y));
+
+                    Mat rVec, tVec;
+                    solvePnP(objectPoints, imagePoints, cameraMatrix, distortionCoeffs, rVec, tVec);
+                    Vec3d eulerVec = rotationVectorToEulerAngles(rVec);
+                    vector<Point2f> projectedPointsLeft, projectedPointsRight;
+
+                    projectPoints(cubePoints, rVec, tVec, cameraMatrixLeft, distortionCoeffs, projectedPointsLeft);
+                    projectPoints(cubePoints, rVec, tVec, cameraMatrixRight, distortionCoeffs, projectedPointsRight);
+
+                    Mat cubeFrameLeft = Mat::zeros(frame.size(), frame.type());
+                    Mat cubeFrameRight = Mat::zeros(frame.size(), frame.type());
+
+                    for (int i = 0; i < 4; i++) {
+                        line(cubeFrameLeft, projectedPointsLeft[i], projectedPointsLeft[(i + 1) % 4], Scalar(255, 0, 0), 2);  // Bottom square
+                        line(cubeFrameLeft, projectedPointsLeft[i + 4], projectedPointsLeft[(i + 1) % 4 + 4], Scalar(255, 0, 0), 2);  // Top square
+                        line(cubeFrameLeft, projectedPointsLeft[i], projectedPointsLeft[i + 4], Scalar(255, 0, 0), 2);  // Vertical lines
+
+                        line(cubeFrameRight, projectedPointsRight[i], projectedPointsRight[(i + 1) % 4], Scalar(255, 0, 0), 2);  // Bottom square
+                        line(cubeFrameRight, projectedPointsRight[i + 4], projectedPointsRight[(i + 1) % 4 + 4], Scalar(255, 0, 0), 2);  // Top square
+                        line(cubeFrameRight, projectedPointsRight[i], projectedPointsRight[i + 4], Scalar(255, 0, 0), 2);  // Vertical lines
+                    }
+
+                    drawPolygon(cubeFrameLeft, vector<Point2f> {projectedPointsLeft[0], projectedPointsLeft[1], projectedPointsLeft[2], projectedPointsLeft[3]}, Scalar(100, 100, 255)); // Front face
+                    drawPolygon(cubeFrameLeft, vector<Point2f> {projectedPointsLeft[4], projectedPointsLeft[5], projectedPointsLeft[6], projectedPointsLeft[7]}, Scalar(100, 255, 100)); // Back face
+                    drawPolygon(cubeFrameLeft, vector<Point2f> {projectedPointsLeft[0], projectedPointsLeft[3], projectedPointsLeft[7], projectedPointsLeft[4]}, Scalar(255, 100, 100)); // Left face
+                    drawPolygon(cubeFrameLeft, vector<Point2f> {projectedPointsLeft[1], projectedPointsLeft[2], projectedPointsLeft[6], projectedPointsLeft[5]}, Scalar(100, 255, 255)); // Right face
+                    drawPolygon(cubeFrameLeft, vector<Point2f> {projectedPointsLeft[0], projectedPointsLeft[1], projectedPointsLeft[5], projectedPointsLeft[4]}, Scalar(255, 255, 100)); // Top face
+                    drawPolygon(cubeFrameLeft, vector<Point2f> {projectedPointsLeft[2], projectedPointsLeft[3], projectedPointsLeft[7], projectedPointsLeft[6]}, Scalar(255, 100, 255)); // Bottom face
+
+                    drawPolygon(cubeFrameRight, vector<Point2f> {projectedPointsRight[0], projectedPointsRight[1], projectedPointsRight[2], projectedPointsRight[3]}, Scalar(100, 100, 255)); // Front face
+                    drawPolygon(cubeFrameRight, vector<Point2f> {projectedPointsRight[4], projectedPointsRight[5], projectedPointsRight[6], projectedPointsRight[7]}, Scalar(100, 255, 100)); // Back face
+                    drawPolygon(cubeFrameRight, vector<Point2f> {projectedPointsRight[0], projectedPointsRight[3], projectedPointsRight[7], projectedPointsRight[4]}, Scalar(255, 100, 100)); // Left face
+                    drawPolygon(cubeFrameRight, vector<Point2f> {projectedPointsRight[1], projectedPointsRight[2], projectedPointsRight[6], projectedPointsRight[5]}, Scalar(100, 255, 255)); // Right face
+                    drawPolygon(cubeFrameRight, vector<Point2f> {projectedPointsRight[0], projectedPointsRight[1], projectedPointsRight[5], projectedPointsRight[4]}, Scalar(255, 255, 100)); // Top face
+                    drawPolygon(cubeFrameRight, vector<Point2f> {projectedPointsRight[2], projectedPointsRight[3], projectedPointsRight[7], projectedPointsRight[6]}, Scalar(255, 100, 255)); // Bottom face
+
+                    string angle_str = "Angle: X: " + round2d(rad2Deg(eulerVec[0])) +
+                        " Y: " + round2d(rad2Deg(eulerVec[1])) +
+                        " Z: " + round2d(rad2Deg(eulerVec[2]));
+
+                    string locat_str = "Distance: " + round2d(tVec.at<double>(2, 0)) + " CM";
+                    putText(cubeFrameLeft, angle_str, Point(10, 30), FONT_HERSHEY_SIMPLEX, 1.0, Scalar(0, 0, 255), 2);
+                    putText(cubeFrameLeft, locat_str, Point(10, 60), FONT_HERSHEY_SIMPLEX, 1.0, Scalar(255, 0, 255), 2);
+
+                    putText(cubeFrameRight, angle_str, Point(10, 30), FONT_HERSHEY_SIMPLEX, 1.0, Scalar(0, 0, 255), 2);
+                    putText(cubeFrameRight, locat_str, Point(10, 60), FONT_HERSHEY_SIMPLEX, 1.0, Scalar(255, 0, 255), 2);
+
+                    Mat combinedFrame(Size(800, 480), frame.type());
+                    Mat left(combinedFrame, Rect(0, 0, 400, 480));
+                    Mat right(combinedFrame, Rect(400, 0, 400, 480));
+
+                    resize(cubeFrameLeft, left, Size(400, 480));
+                    resize(cubeFrameRight, right, Size(400, 480));
+
+                    imshow("Side-by-Side Cube", combinedFrame);
+
+                    resizeWindow("Side-by-Side Cube", 800, 480); // Adjust window size
+                } else {
+                    qrDetected = false;
+                }
+                grayFrame.copyTo(gray_prev);
+            }
+        } else {
+            putText(frame, "No QR Code!!", Point(10, 30), FONT_HERSHEY_SIMPLEX, 1.0, Scalar(0, 255, 255), 2);
+        }
+
+        string infor = "     ";
+        putText(frame, infor, Point(10, 450), FONT_HERSHEY_SIMPLEX, 1.0, Scalar(255, 0, 255), 2);
+
+        imshow("QR Code Detection", frame);
+
+        resizeWindow("QR Code Detection", 800, 480); // Adjust window size
+
+        if (waitKey(1) == 27) {
+            break;
+        }
+    }
+
+    destroyAllWindows();
+    return 0;
+}
